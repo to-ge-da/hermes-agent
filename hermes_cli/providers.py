@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 class HermesOverlay:
     """Hermes-specific provider metadata layered on top of models.dev."""
 
-    transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses
+    transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses | external harness
     is_aggregator: bool = False
     auth_type: str = "api_key"            # api_key | oauth_device_code | oauth_external | external_process
     extra_env_vars: Tuple[str, ...] = ()  # env vars models.dev doesn't list
@@ -416,6 +416,8 @@ TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "anthropic_messages": "anthropic_messages",
     "codex_responses": "codex_responses",
     "bedrock_converse": "bedrock_converse",
+    "cursor_agent": "cursor_agent",
+    "codex_app_server": "codex_app_server",
 }
 
 
@@ -496,6 +498,37 @@ def get_provider(name: str) -> Optional[ProviderDef]:
             is_aggregator=overlay.is_aggregator,
             auth_type=overlay.auth_type,
             source="hermes",
+        )
+
+    # Model-provider plugins are a first-class provider source too. Keep this
+    # fallback after models.dev/overlays so existing built-ins retain their
+    # richer catalog metadata, while plugin-only providers (such as Cursor)
+    # resolve consistently in ``hermes model`` and the /model command.
+    #
+    # Function-local import is required: importing the profile registry at
+    # module load discovers plugins, and some provider plugins import this
+    # module while registering themselves.
+    try:
+        from providers import get_provider_profile
+
+        profile = get_provider_profile(canonical)
+    except Exception:
+        profile = None
+    if profile is not None:
+        api_mode_to_transport = {
+            api_mode: transport
+            for transport, api_mode in TRANSPORT_TO_API_MODE.items()
+        }
+        transport = api_mode_to_transport.get(profile.api_mode, profile.api_mode)
+        return ProviderDef(
+            id=profile.name,
+            name=profile.display_name or profile.name,
+            transport=transport,
+            api_key_env_vars=tuple(profile.env_vars),
+            base_url=profile.base_url,
+            auth_type=profile.auth_type,
+            doc=profile.signup_url,
+            source="plugin",
         )
 
     return None

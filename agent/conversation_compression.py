@@ -1362,6 +1362,22 @@ def compress_context(
             if _codex_fence_entered:
                 commit_fence.finish_commit()
 
+    # Cursor runtime sessions: the cursor agent owns its real conversation
+    # context server/bridge-side and manages its own window (it self-compacts
+    # and emits SummaryUpdate events). There is no externally-triggerable
+    # compaction in the SDK, so Hermes' summarizer must never rewrite the
+    # projected transcript — it would desync the local mirror from cursor's
+    # actual thread without shrinking anything (same class of bug as #36801
+    # on the codex runtime). Always a no-op here; ``compression.cursor_auto``
+    # documents the posture (native = trust cursor; off = same, minus logs).
+    if getattr(agent, "api_mode", None) == "cursor_agent":
+        if str(getattr(agent, "cursor_auto_compaction", "native")) != "off":
+            logger.info(
+                "cursor runtime: skipping Hermes compression — the cursor "
+                "agent manages its own context window natively"
+            )
+        return messages, system_message
+
     # Every automatic entrypoint must honor compressor-owned cooldown and
     # breaker state. Gateway hygiene constructs a fresh AIAgent, so the
     # persisted fallback streak is loaded by bind_session_state() before this.

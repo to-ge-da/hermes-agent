@@ -1542,6 +1542,14 @@ DEFAULT_CONFIG = {
                                       # Hermes' compression threshold triggers
                                       # thread/compact/start; off = never auto-trigger
                                       # (codex may still compact natively).
+        "cursor_auto": "native",      # Cursor (cursor-sdk runtime) context handling.
+                                      # The cursor agent owns its real conversation
+                                      # context server/bridge-side and exposes no
+                                      # externally-triggerable compaction, so Hermes'
+                                      # summarizer never rewrites cursor transcripts.
+                                      # native = trust cursor's internal window
+                                      # management (default); off = same behavior but
+                                      # also suppresses compaction bookkeeping/logs.
         "in_place": True,             # When True, compaction rewrites the message
                                       # list and rebuilds the system prompt WITHOUT
                                       # rotating the session id — the conversation
@@ -1630,6 +1638,52 @@ DEFAULT_CONFIG = {
             "guardrail_version": "",     # e.g. "1" or "DRAFT"
             "stream_processing_mode": "async",  # "sync" or "async"
             "trace": "disabled",         # "enabled", "disabled", or "enabled_full"
+        },
+    },
+
+    # Cursor provider (official cursor-sdk agent runtime). Active when
+    # model.provider is "cursor" — every turn is driven through the
+    # cursor-sdk Agent/Run surface (api_mode "cursor_agent"), mirroring the
+    # codex app-server runtime. Requires CURSOR_API_KEY in ~/.hermes/.env.
+    # See website/docs/user-guide/features/cursor-agent-runtime.md.
+    "cursor": {
+        "runtime": "local",          # local | cloud — where the primary-model agent runs.
+                                     # local = against the working tree on this machine;
+                                     # cloud = a Cursor-hosted VM (configure cloud: below).
+        "mode": "agent",             # agent | plan. plan = explore/design first (read-only
+                                     # posture); agent = implement changes directly.
+        "expose_hermes_tools": True, # Bridge Hermes' tool surface (web_search, browser_*,
+                                     # vision, skills, kanban, TTS, ...) into cursor turns
+                                     # via the SDK's custom_tools. Local runtime only —
+                                     # the SDK does not support custom tools on cloud runs.
+        "inherit_mcp": False,        # Pass Hermes' mcp_servers config to cursor as inline
+                                     # SDK MCP definitions. Servers requiring interactive
+                                     # OAuth are skipped (the SDK cannot open a browser).
+        "setting_sources": [],       # SDK setting_sources for local runs. Any of:
+                                     # project | user | team | mdm | plugins | all.
+                                     # Empty (default) = inline config only, matching the
+                                     # SDK's own default.
+        "sandbox": {},               # Pass-through SandboxOptions dict for local runs.
+        "model_params": {},          # Model-keyed parameter values forwarded as
+                                     # ModelSelection.params, e.g.
+                                     # {"composer-2.5": {fast: "true"}}.
+                                     # Discover valid ids with `hermes cursor models`.
+        "agents": {},                # Inline subagent definitions passed to Agent.create:
+                                     # {name: {description: ..., prompt: ..., model: inherit}}.
+                                     # File-based subagents (.cursor/agents/*.md) load via
+                                     # setting_sources instead.
+        "timeout_seconds": 1800,     # Per-turn idle timeout. Resets on every stream event,
+                                     # so long turns stay alive while events flow; a silent
+                                     # bridge past this window retires the session.
+        "cloud": {
+            "repos": [],             # Repositories cloned into the cloud VM when
+                                     # runtime: cloud. Each entry: {url: ..., ref: ...}
+                                     # (ref optional). Empty = no-repo agent with an
+                                     # empty workspace.
+            "auto_create_pr": False,       # Open a PR when a cloud run finishes.
+            "work_on_current_branch": False,  # Push to the existing branch instead of a new one.
+            "env": {},               # Self-hosted pool target, e.g. {type: pool, name: my-pool}.
+                                     # Empty = Cursor-hosted VMs.
         },
     },
 
@@ -3866,6 +3920,15 @@ OPTIONAL_ENV_VARS = {
         "prompt": "Vertex service account JSON path (leave empty to use ADC / GOOGLE_APPLICATION_CREDENTIALS)",
         "url": "https://cloud.google.com/iam/docs/keys-create-delete",
         "password": False,
+        "category": "provider",
+        "advanced": True,
+    },
+    "CURSOR_API_KEY": {
+        "description": "Cursor API key for the Cursor provider (official cursor-sdk). "
+                       "User or service-account key from Cursor Dashboard → Integrations.",
+        "prompt": "Cursor API key",
+        "url": "https://cursor.com/dashboard?tab=integrations",
+        "password": True,
         "category": "provider",
         "advanced": True,
     },

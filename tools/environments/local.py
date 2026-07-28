@@ -460,6 +460,8 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (base_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             continue
+        if key in _ALWAYS_STRIP_KEYS:
+            continue
         if _is_hermes_internal_secret(key):
             continue
         if key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
@@ -468,9 +470,11 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     for key, value in (extra_env or {}).items():
         if key.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = key[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if real_key in _ALWAYS_STRIP_KEYS or _is_hermes_internal_secret(real_key):
                 continue
             sanitized[real_key] = value
+        elif key in _ALWAYS_STRIP_KEYS:
+            continue
         elif _is_hermes_internal_secret(key):
             continue
         elif key not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(key):
@@ -546,6 +550,12 @@ _ALWAYS_STRIP_KEYS: frozenset[str] = frozenset({
     "HASS_TOKEN",
     "EMAIL_PASSWORD",
     "HERMES_DASHBOARD_SESSION_TOKEN",
+    "CURSOR_API_KEY",
+    # Cursor web-session cookie injected into Cursor Cloud Agent environments.
+    # The SDK bridge only needs the explicit CURSOR_API_KEY passed in options;
+    # exposing this browser session to model-driven shell commands grants
+    # unrelated account-level web access.
+    "WorkosCursorSessionToken",
     # Remote-compute / infrastructure secrets
     "MODAL_TOKEN_ID",
     "MODAL_TOKEN_SECRET",
@@ -1160,9 +1170,11 @@ def _make_run_env(env: dict) -> dict:
     for k, v in merged.items():
         if k.startswith(_HERMES_PROVIDER_ENV_FORCE_PREFIX):
             real_key = k[len(_HERMES_PROVIDER_ENV_FORCE_PREFIX):]
-            if _is_hermes_internal_secret(real_key):
+            if real_key in _ALWAYS_STRIP_KEYS or _is_hermes_internal_secret(real_key):
                 continue
             run_env[real_key] = v
+        elif k in _ALWAYS_STRIP_KEYS:
+            continue
         elif _is_hermes_internal_secret(k):
             continue
         elif k not in _HERMES_PROVIDER_ENV_BLOCKLIST or _is_passthrough(k):

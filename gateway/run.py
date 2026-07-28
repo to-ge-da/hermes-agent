@@ -18728,6 +18728,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "threshold_tokens"),
         ("compression", "codex_gpt55_autoraise"),
         ("compression", "codex_app_server_auto"),
+        ("compression", "cursor_auto"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
         ("compression", "proactive_prune_tokens"),
@@ -18736,6 +18737,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "min_tail_user_messages"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
+        # Cursor runtime knobs are baked into the per-agent CursorSDKSession
+        # when it is first built — a running gateway must rebuild the agent
+        # to pick up an edit.
+        ("cursor", "runtime"),
+        ("cursor", "mode"),
+        ("cursor", "expose_hermes_tools"),
+        ("cursor", "inherit_mcp"),
         ("checkpoints", "enabled"),
         ("checkpoints", "max_snapshots"),
         ("checkpoints", "max_total_size_mb"),

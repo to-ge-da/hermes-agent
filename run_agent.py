@@ -733,6 +733,12 @@ class AIAgent:
         instead of a bare reset. Default callers pass nothing and keep the
         existing reset-only behavior.
         """
+        # External agent harnesses keep their own conversation state outside
+        # Hermes' ``messages`` list. A /new, /resume, or /branch boundary must
+        # therefore dispose the old handle rather than carrying its hidden
+        # transcript into the newly selected Hermes session.
+        self._close_external_runtime_sessions()
+
         # Token usage counters
         self.session_total_tokens = 0
         self.session_input_tokens = 0
@@ -3823,6 +3829,28 @@ class AIAgent:
         except Exception:
             pass
 
+    def _close_external_runtime_sessions(self) -> None:
+        """Close persistent external-agent handles owned by this AIAgent.
+
+        Cursor SDK and Codex app-server sessions both own subprocesses. They
+        are resumable from their persisted ids, so soft cache eviction can
+        safely close them just like the OpenAI/httpx client pool.
+        """
+        for attr_name in ("_cursor_session", "_codex_session"):
+            session = getattr(self, attr_name, None)
+            if session is None:
+                continue
+            try:
+                session.close()
+            except Exception:
+                logger.debug(
+                    "failed to close external runtime session %s",
+                    attr_name,
+                    exc_info=True,
+                )
+            finally:
+                setattr(self, attr_name, None)
+
     def release_clients(self) -> None:
         """Release LLM client resources WITHOUT tearing down session tool state.
 
@@ -3860,6 +3888,11 @@ class AIAgent:
                         pass
         except Exception:
             pass
+
+        # Close bridge/app-server subprocesses. Their durable conversation ids
+        # are persisted, so a rebuilt AIAgent can resume without keeping these
+        # process resources alive in the cache.
+        self._close_external_runtime_sessions()
 
         # Retire the OpenAI/httpx client to release sockets immediately.
         # #70773: eviction runs on the gateway's memory-manager thread — a
@@ -3922,7 +3955,10 @@ class AIAgent:
         except Exception:
             pass
 
-        # 5. Close the OpenAI/httpx client
+        # 5. Close external agent-runtime subprocesses.
+        self._close_external_runtime_sessions()
+
+        # 6. Close the OpenAI/httpx client
         try:
             client = getattr(self, "client", None)
             if client is not None:
@@ -3931,7 +3967,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 6. Free conversation history.  Mirrors _release_evicted_agent_soft's
+        # 7. Free conversation history.  Mirrors _release_evicted_agent_soft's
         # soft-eviction clear — close() is the hard teardown for true session
         # boundaries (/new, /reset, session expiry), so the message list won't
         # be reused.  Drops the reference proactively rather than waiting for
@@ -3942,7 +3978,7 @@ class AIAgent:
         except Exception:
             pass
 
-        # 7. Finalize the owned SQLite session row unless this agent is only a
+        # 8. Finalize the owned SQLite session row unless this agent is only a
         # temporary helper that deliberately handed session ownership forward
         # (manual compression helpers that rotate to a continuation session_id,
         # or background-review forks that share the live parent's session_id and
@@ -6923,6 +6959,30 @@ class AIAgent:
         """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
         from agent.codex_runtime import run_codex_app_server_turn
         return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
+
+    def _run_cursor_agent_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+        external_memory_context: str = "",
+        plugin_user_context: str = "",
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.cursor_runtime.run_cursor_agent_turn``."""
+        from agent.cursor_runtime import run_cursor_agent_turn
+        return run_cursor_agent_turn(
+            self,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=should_review_memory,
+            external_memory_context=external_memory_context,
+            plugin_user_context=plugin_user_context,
+        )
 
 def main(
     query: str = None,

@@ -483,6 +483,14 @@ compression:
   #   off    = Hermes will not auto-trigger compaction; Codex may still compact natively
   codex_app_server_auto: native
 
+  # Cursor (cursor-sdk runtime) context handling. The cursor agent owns its
+  # conversation context server/bridge-side and exposes no externally
+  # triggerable compaction, so Hermes' summarizer never rewrites cursor
+  # transcripts.
+  #   native = trust cursor's internal window management (default)
+  #   off    = same behavior, but suppress compaction bookkeeping/logs
+  cursor_auto: native
+
   # Number of non-system messages to protect at the head of the transcript, in
   # ADDITION to the system prompt (which is always implicitly protected).
   # Head messages are NEVER summarized — they survive every compression
@@ -545,6 +553,64 @@ compression:
 #
 prompt_caching:
   cache_ttl: "5m" # use "1h" for long sessions with pauses between turns
+
+# =============================================================================
+# Cursor provider (official cursor-sdk agent runtime)
+# =============================================================================
+# Active when model.provider is "cursor" — every turn runs through the
+# cursor-sdk Agent/Run surface. Requires CURSOR_API_KEY in ~/.hermes/.env
+# (Cursor Dashboard → Integrations → API Keys). Cloud agents are managed
+# separately with `hermes cursor`. Full docs:
+# https://hermes-agent.nousresearch.com/docs/user-guide/features/cursor-agent-runtime
+#
+cursor:
+  # Where the primary-model agent runs:
+  #   local = against the working tree on this machine (default)
+  #   cloud = a Cursor-hosted VM (configure cloud: below)
+  runtime: local
+
+  # Conversation mode: agent = implement changes directly (default);
+  # plan = explore/design first (read-only posture).
+  mode: agent
+
+  # Bridge Hermes' tool surface (web_search, browser_*, vision, skills,
+  # kanban, TTS, ...) into cursor turns via SDK custom tools. Local only.
+  expose_hermes_tools: true
+
+  # Pass Hermes' mcp_servers config to cursor as inline SDK definitions.
+  # Servers requiring interactive OAuth are skipped.
+  inherit_mcp: false
+
+  # SDK setting_sources for local runs — which on-disk .cursor/ layers load:
+  # any of project | user | team | mdm | plugins | all. Empty = inline only.
+  setting_sources: []
+
+  # Pass-through SandboxOptions dict for local runs.
+  sandbox: {}
+
+  # Model-keyed parameter values (ModelSelection.params), e.g.:
+  #   composer-2.5: {fast: "true"}
+  # Discover valid ids with `hermes cursor models`.
+  model_params: {}
+
+  # Inline subagent definitions cursor can spawn via its Agent tool:
+  #   code-reviewer:
+  #     description: Expert reviewer for quality and security.
+  #     prompt: Review code for bugs, security issues, and proven approaches.
+  agents: {}
+
+  # Per-turn idle timeout (seconds). Resets on every stream event; a silent
+  # bridge past this window is cancelled and the session retired.
+  timeout_seconds: 1800
+
+  cloud:
+    # Repositories cloned into the VM when runtime: cloud.
+    #   - url: https://github.com/org/repo
+    #     ref: main            # optional starting ref
+    repos: []
+    auto_create_pr: false       # open a PR when a cloud run finishes
+    work_on_current_branch: false
+    env: {}                     # self-hosted pool: {type: pool, name: my-pool}
 
 # =============================================================================
 # Auxiliary Models (Advanced — Experimental)

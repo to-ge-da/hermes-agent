@@ -911,6 +911,12 @@ def resolve_billing_route(
 
     if provider_name == "openai-codex":
         return BillingRoute(provider="openai-codex", model=model, base_url=base_url or "", billing_mode="subscription_included")
+    if provider_name == "cursor" or base_url_host_matches(base_url or "", "api.cursor.com"):
+        # Cursor bills SDK runs against the user's Cursor subscription
+        # (same request pools as the IDE/CLI) — there is no per-token
+        # price list to estimate from, so treat it like the Codex OAuth
+        # subscription route.
+        return BillingRoute(provider="cursor", model=model, base_url=base_url or "", billing_mode="subscription_included")
     if provider_name == "openrouter" or base_url_host_matches(base_url or "", "openrouter.ai"):
         return BillingRoute(provider="openrouter", model=model, base_url=base_url or "", billing_mode="official_models_api")
     if provider_name == "nous" or base_url_host_matches(base_url or "", "inference-api.nousresearch.com"):

@@ -442,6 +442,7 @@ from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
+from hermes_cli.subcommands.cursor import build_cursor_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
 from hermes_cli.subcommands.security import build_security_parser
@@ -4518,6 +4519,15 @@ def cmd_webhook(args):
     from hermes_cli.webhook import webhook_command
 
     webhook_command(args)
+
+
+def cmd_cursor(args):
+    """Cursor cloud agents + model catalog (official cursor-sdk)."""
+    from hermes_cli.cursor_cli import cursor_command
+
+    exit_code = cursor_command(args)
+    if exit_code:
+        sys.exit(exit_code)
 
 
 def cmd_slack(args):
@@ -13762,6 +13772,7 @@ def _coalesce_session_name_args(argv: list) -> list:
         "security",
         "acp",
         "webhook",
+        "cursor",
         "memory",
         "dump",
         "debug",
@@ -15145,7 +15156,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
     {
         "acp", "approvals", "auth", "backup", "bundles", "checkpoints", "claw", "completion",
         "computer-use",
-        "config", "console", "cron", "curator", "dashboard", "serve", "debug", "doctor",
+        "config", "console", "cron", "curator", "cursor", "dashboard", "serve", "debug", "doctor",
         "dump", "egress", "fallback", "gateway", "hooks", "import", "insights",
         "gui", "desktop", "kanban", "login", "logout", "logs", "lsp", "mcp", "memory", "migrate", "moa",
         "journey", "memory-graph", "learning",
@@ -15948,6 +15959,11 @@ def main():
     # webhook command  (parser built in hermes_cli/subcommands/webhook.py)
     # =========================================================================
     build_webhook_parser(subparsers, cmd_webhook=cmd_webhook)
+
+    # =========================================================================
+    # cursor command  (parser built in hermes_cli/subcommands/cursor.py)
+    # =========================================================================
+    build_cursor_parser(subparsers, cmd_cursor=cmd_cursor)
 
     # =========================================================================
     # portal command — Nous Portal status + Tool Gateway routing

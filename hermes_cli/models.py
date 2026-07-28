@@ -274,6 +274,16 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    # Cursor — curated fallback only. The live /v1/models catalog (fetched via
+    # the CursorProfile) is the authoritative source and merges live-first
+    # (see _LIVE_FIRST_PICKER_PROVIDERS); Cursor documents it as a
+    # "recommended subset", and the API accepts other model keys too.
+    "cursor": [
+        "composer-2.5",
+        "composer-2",
+        "claude-4.6-sonnet-thinking",
+        "gpt-5.3-codex-high",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",
@@ -2123,7 +2133,7 @@ _BORROWED_MODEL_PROVIDERS: frozenset[str] = frozenset()
 # Zen / Go re-expose dozens of upstream vendors and rotate them frequently, so
 # their stale curated entries must not pollute the top of the picker. (#49129)
 _LIVE_FIRST_PICKER_PROVIDERS: frozenset[str] = frozenset(
-    {"opencode-zen", "opencode-go"}
+    {"opencode-zen", "opencode-go", "cursor"}
 )
 
 
@@ -4420,6 +4430,72 @@ def validate_requested_model(
             "persist": False,
             "recognized": False,
             "message": "Model names cannot contain spaces.",
+        }
+
+    if normalized == "cursor":
+        # Cursor's catalog is a Cloud Agents API shape, not OpenAI's
+        # ``{"data": [...]}``, so the generic /models validator below sees an
+        # empty catalog. Import lazily to avoid the provider-discovery cycle:
+        # some provider plugins import this module while registering.
+        try:
+            from providers import get_provider_profile
+
+            profile = get_provider_profile("cursor")
+            live_models = (
+                profile.fetch_models(
+                    api_key=api_key,
+                    base_url=base_url or None,
+                )
+                if profile is not None and api_key
+                else None
+            )
+        except Exception:
+            profile = None
+            live_models = None
+
+        catalog_models = list(
+            live_models or _PROVIDER_MODELS.get("cursor", [])
+        )
+        resolved_model = (
+            profile.resolve_model_id(requested_for_lookup)
+            if profile is not None and hasattr(profile, "resolve_model_id")
+            else None
+        )
+        resolved_model = resolved_model or requested_for_lookup
+
+        if resolved_model in set(catalog_models):
+            result = {
+                "accepted": True,
+                "persist": True,
+                "recognized": True,
+                "message": None,
+            }
+            if resolved_model != requested_for_lookup:
+                result["corrected_model"] = resolved_model
+                result["message"] = (
+                    f"Resolved Cursor model alias `{requested}` → `{resolved_model}`"
+                )
+            return result
+
+        suggestions = get_close_matches(
+            requested_for_lookup,
+            catalog_models,
+            n=3,
+            cutoff=0.5,
+        )
+        suggestion_text = ""
+        if suggestions:
+            suggestion_text = "\n  Similar models: " + ", ".join(
+                f"`{model}`" for model in suggestions
+            )
+        return {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": (
+                f"Model `{requested}` was not found in Cursor's model listing."
+                f"{suggestion_text}"
+            ),
         }
 
     if normalized == "lmstudio":

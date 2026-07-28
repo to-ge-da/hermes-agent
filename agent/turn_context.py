@@ -778,6 +778,11 @@ def build_turn_context(
             ).lower()
             in {"native", "off"}
         )
+        # Cursor runtime: the cursor agent always owns its own context window
+        # (no externally-triggerable compaction exists in the SDK), so Hermes
+        # never initiates preflight compression on this runtime.
+        if getattr(agent, "api_mode", None) == "cursor_agent":
+            _codex_native_auto = True
 
         if not _preflight_deferred:
             _last = _compressor.last_prompt_tokens

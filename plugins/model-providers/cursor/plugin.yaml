@@ -1,0 +1,5 @@
+name: cursor-provider
+kind: model-provider
+version: 1.0.0
+description: Cursor (Composer) via the official cursor-sdk agent runtime
+author: Nous Research

@@ -11905,6 +11905,11 @@ def _run_prompt_submit(
                     )
                     if getattr(agent, "api_mode", "") == "codex_app_server":
                         _mode = "text"
+                    elif getattr(agent, "api_mode", "") == "cursor_agent":
+                        # The cursor runtime forwards native image parts to
+                        # the SDK (UserMessage images) — see
+                        # agent/cursor_runtime._extract_images_from_content.
+                        _mode = "native"
                 except Exception as _img_exc:
                     print(
                         f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",

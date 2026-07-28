@@ -1258,6 +1258,21 @@ def run_conversation(
             should_review_memory=_should_review_memory,
         )
 
+    # Cursor runtime: provider == "cursor" always implies this mode (no raw
+    # chat-completions surface exists). The turn is driven through the
+    # official cursor-sdk; Hermes tools are bridged INTO the cursor turn via
+    # SDK custom_tools. See agent/cursor_runtime.py.
+    if agent.api_mode == "cursor_agent":
+        return agent._run_cursor_agent_turn(
+            user_message=user_message,
+            original_user_message=original_user_message,
+            messages=messages,
+            effective_task_id=effective_task_id,
+            should_review_memory=_should_review_memory,
+            external_memory_context=_ext_prefetch_cache,
+            plugin_user_context=_plugin_user_context,
+        )
+
     while (api_call_count < agent.max_iterations and agent.iteration_budget.remaining > 0) or agent._budget_grace_call:
         _redirect_text = agent._drain_pending_redirect()
         if _redirect_text:

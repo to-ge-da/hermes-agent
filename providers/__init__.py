@@ -33,6 +33,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -48,6 +49,14 @@ _discovered = False
 _BUNDLED_PLUGINS_DIR = (
     Path(__file__).resolve().parent.parent / "plugins" / "model-providers"
 )
+
+
+def _bundled_plugins_dir() -> Path:
+    """Return the packaged or in-repo model-provider plugin directory."""
+    override = os.getenv("HERMES_BUNDLED_PLUGINS")
+    if override:
+        return Path(override) / "model-providers"
+    return _BUNDLED_PLUGINS_DIR
 
 
 def register_provider(profile: ProviderProfile) -> None:
@@ -154,8 +163,9 @@ def _discover_providers() -> None:
     _discovered = True
 
     # 1. Bundled plugins — shipped with hermes-agent.
-    if _BUNDLED_PLUGINS_DIR.is_dir():
-        for child in sorted(_BUNDLED_PLUGINS_DIR.iterdir()):
+    bundled_plugins_dir = _bundled_plugins_dir()
+    if bundled_plugins_dir.is_dir():
+        for child in sorted(bundled_plugins_dir.iterdir()):
             if not child.is_dir() or child.name.startswith(("_", ".")):
                 continue
             _import_plugin_dir(child, "bundled")

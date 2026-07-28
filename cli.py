@@ -1203,6 +1203,16 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
         shutdown_cached_clients()
     except Exception:
         pass
+    # Cursor SDK and Codex app-server sessions own subprocesses that are not
+    # part of terminal/browser cleanup. Close them before interpreter teardown
+    # so bridge processes do not outlive the classic CLI.
+    try:
+        if _active_agent_ref and hasattr(
+            _active_agent_ref, "_close_external_runtime_sessions"
+        ):
+            _active_agent_ref._close_external_runtime_sessions()
+    except Exception:
+        logger.warning("CLI cleanup external runtime shutdown failed", exc_info=True)
     # Shut down memory provider (on_session_end + shutdown_all) at actual
     # session boundary — NOT per-turn inside run_conversation().
     if notify_session_finalize:
@@ -12763,6 +12773,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         turn_route = self._resolve_turn_agent_config(message)
         if turn_route["signature"] != self._active_agent_route_signature:
+            if self.agent is not None:
+                try:
+                    self.agent.release_clients()
+                except Exception:
+                    logger.debug(
+                        "failed to release previous turn-route agent",
+                        exc_info=True,
+                    )
             self.agent = None
 
         # Initialize agent if needed
@@ -13291,7 +13309,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Handle failed or partial results (e.g., non-retryable errors, rate limits,
             # truncated output, invalid tool calls). Both "failed" and "partial" with
             # an empty final_response mean the agent couldn't produce a usable answer.
-            if result and (result.get("failed") or result.get("partial")) and not response:
+            if (
+                result
+                and (result.get("failed") or result.get("partial"))
+                and not result.get("interrupted")
+                and not response
+            ):
                 error_detail = result.get("error", "Unknown error")
                 response = f"Error: {error_detail}"
                 # Stop continuous voice mode on persistent errors (e.g. 429 rate limit)

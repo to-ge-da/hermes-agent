@@ -2096,6 +2096,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     old_model = agent.model
     old_provider = agent.provider
+    old_api_mode = getattr(agent, "api_mode", "")
 
     # ── Snapshot all fields the swap+rebuild can mutate ──
     # If the rebuild raises (bad API key, network error, build_anthropic_client
@@ -2259,6 +2260,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             agent._is_anthropic_oauth = _is_oauth_token(effective_key) if (_is_native_anthropic and isinstance(effective_key, str)) else False
             agent.client = None
             agent._client_kwargs = {}
+        elif api_mode in {"cursor_agent", "codex_app_server"}:
+            # External agent harnesses create their own clients lazily on the
+            # first turn. Building an OpenAI client against their non-OpenAI
+            # control-plane URL makes the switch appear successful but fails
+            # on the next prompt.
+            agent.client = None
+            agent._client_kwargs = {}
         else:
             effective_key = api_key or agent.api_key
             effective_base = base_url or agent.base_url
@@ -2314,6 +2322,13 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             except Exception:  # noqa: BLE001
                 pass
         raise
+
+    if (
+        old_api_mode != api_mode
+        and {old_api_mode, api_mode} & {"cursor_agent", "codex_app_server"}
+        and hasattr(agent, "_close_external_runtime_sessions")
+    ):
+        agent._close_external_runtime_sessions()
 
     # ── Re-evaluate prompt caching ──
     agent._use_prompt_caching, agent._use_native_cache_layout = (

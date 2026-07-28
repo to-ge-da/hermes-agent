@@ -254,6 +254,12 @@ DEFAULT_CONTEXT_LENGTHS = {
     "gpt-5": 400000,                  # GPT-5.x base, mini, codex variants (400k)
     "gpt-4.1": 1047576,
     "gpt-4": 128000,
+    # Cursor Composer (cursor provider, cursor-sdk runtime) — Cursor caps the
+    # agent context at 200K. Frontier models routed through Cursor resolve
+    # via their own family entries above/below.
+    "composer-2.5": 200000,
+    "composer-2": 200000,
+    "composer": 200000,
     # Google
     "gemini": 1048576,
     # Gemma (open models served via AI Studio)
