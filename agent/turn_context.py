@@ -781,14 +781,21 @@ def build_turn_context(
         # Cursor runtime: the cursor agent always owns its own context window
         # (no externally-triggerable compaction exists in the SDK), so Hermes
         # never initiates preflight compression on this runtime.
-        if getattr(agent, "api_mode", None) == "cursor_agent":
+        _cursor_native = getattr(agent, "api_mode", None) == "cursor_agent"
+        if _cursor_native:
             _codex_native_auto = True
 
-        if not _preflight_deferred:
+        if not _preflight_deferred and not _cursor_native:
             _last = _compressor.last_prompt_tokens
             # Do NOT overwrite the -1 sentinel (#36718).
             if _last >= 0 and _preflight_tokens > _last:
                 _compressor.last_prompt_tokens = _preflight_tokens
+        # For cursor the rough estimate measures Hermes' local transcript
+        # mirror, which only ever grows — compaction happens bridge-side and
+        # never shrinks the mirror. Seeding the gauge from it clobbered the
+        # real usage meter with impossible readings (728K/500K at 100%).
+        # Cursor's meter is driven solely by the SDK's per-step usage events
+        # (and parked by note_external_compaction on native compaction).
 
         _compression_cooldown = getattr(
             _compressor,

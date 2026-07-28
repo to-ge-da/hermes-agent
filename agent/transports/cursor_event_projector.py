@@ -15,6 +15,13 @@ Cursor emits messages with a discriminator field ``type``:
                   messages only on the terminal event, mirroring how Hermes
                   only writes assistant messages after streaming completes.
   - usage       → per-turn TokenUsage, tracked for accounting (no message)
+  - summary / summary-started / summary-completed
+                → cursor native context compaction notices. These surface as
+                  ``compaction`` on the projection result (no messages) so the
+                  context meter can drop its now-stale pre-compaction reading.
+                  They normally arrive through the SDK's ``on_delta``
+                  interaction-update channel, but unknown message types also
+                  flow into ``run.messages()`` as raw mappings — handle both.
   - system/user/status/task/request → display/accounting only (no messages)
 
 Each tool call maps to exactly one assistant entry + one tool entry,
@@ -141,6 +148,17 @@ class CursorProjectionResult:
     tool_started: Optional[tuple[str, str, dict]] = None
     # Set when a usage stream event arrives: raw TokenUsage-shaped object.
     usage: Any = None
+    # Set when cursor reports a native context-compaction event:
+    # ("started" | "update" | "completed", summary_text). No messages — the
+    # session forwards it to the context meter.
+    compaction: Optional[tuple[str, str]] = None
+
+
+SUMMARY_EVENT_KINDS = {
+    "summary": "update",
+    "summary-started": "started",
+    "summary-completed": "completed",
+}
 
 
 class CursorEventProjector:
@@ -157,6 +175,8 @@ class CursorEventProjector:
         # start but not finish. finalize() closes leftovers.
         self._open_tool_calls: dict[str, dict] = {}
         self._assistant_texts: list[str] = []
+        # Native compaction event kinds observed this run, in order.
+        self.compaction_events: list[str] = []
 
     # ---------- per-message ----------
 
@@ -175,6 +195,8 @@ class CursorEventProjector:
                 return self._project_tool_call(message)
             if msg_type == "usage":
                 return CursorProjectionResult(usage=_get(message, "usage"))
+            if msg_type in SUMMARY_EVENT_KINDS:
+                return self._project_summary_event(msg_type, message)
             # system / user / status / task / request / unknown → no messages.
             # (The user message is already in Hermes' list — run_conversation
             # appended it before dispatching the turn.)
@@ -182,6 +204,13 @@ class CursorEventProjector:
         except Exception:
             logger.debug("cursor projector: failed to project %r", message, exc_info=True)
             return CursorProjectionResult()
+
+    def _project_summary_event(self, msg_type: str, message: Any) -> CursorProjectionResult:
+        """Surface a cursor native-compaction notice; never a message."""
+        kind = SUMMARY_EVENT_KINDS[msg_type]
+        self.compaction_events.append(kind)
+        summary = str(_get(message, "summary", "") or "")
+        return CursorProjectionResult(compaction=(kind, summary))
 
     def _project_assistant(self, message: Any) -> CursorProjectionResult:
         inner = _get(message, "message") or {}

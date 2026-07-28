@@ -2046,6 +2046,9 @@ class ContextCompressor(ContextEngine):
         self.last_compression_rough_tokens = 0
         self.last_rough_tokens_when_real_prompt_fit = 0
         self.awaiting_real_usage_after_compression = False
+        # Wall-clock of the last provider-native compaction notice (e.g. the
+        # cursor agent self-managing its window). 0.0 = none observed.
+        self.last_external_compaction_at: float = 0.0
 
         self.summary_model = summary_model_override or ""
         self._session_db: Any = None
@@ -2176,6 +2179,35 @@ class ContextCompressor(ContextEngine):
         # it armed for a later, unrelated reading.
         self._verify_compaction_cleared_threshold = False
         self.awaiting_real_usage_after_compression = False
+
+    def note_external_compaction(self, *, kind: str = "completed", summary: str = "") -> None:
+        """Record a provider-native compaction Hermes did not run itself.
+
+        The cursor agent owns its context window bridge/server-side and
+        self-compacts, emitting SummaryUpdate / SummaryStartedUpdate /
+        SummaryCompletedUpdate events. When that happens the meter's last
+        real prompt reading is stale-high (it predates the shrink), so park
+        ``last_prompt_tokens`` at the -1 "awaiting real usage" sentinel
+        (#36718) — every gauge path already clamps that to "unknown" — until
+        the provider's next usage event reports the shrunken window. Without
+        this the bar pins at/over 100% after a native compaction.
+
+        ``kind`` is "started" | "update" | "completed". A bare "started"
+        only arms the timestamp: the window has not shrunk yet and the
+        compaction could still abort, so the reading stays as-is.
+        """
+        self.last_external_compaction_at = time.time()
+        if kind == "started":
+            logger.info("Provider-native context compaction started")
+            return
+        self.last_prompt_tokens = -1
+        self.awaiting_real_usage_after_compression = True
+        logger.info(
+            "Provider-native context compaction %s (summary=%d chars); "
+            "context gauge parked until the next real usage event",
+            kind,
+            len(summary or ""),
+        )
 
     def snapshot_preflight_display_tokens(self) -> int:
         """Capture the display token count before a speculative preflight seed."""

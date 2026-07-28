@@ -43,7 +43,10 @@ from typing import Any, Callable, Optional
 
 from agent.redact import redact_sensitive_text
 from agent.transports.cursor_bridge import launch_cursor_bridge
-from agent.transports.cursor_event_projector import CursorEventProjector
+from agent.transports.cursor_event_projector import (
+    SUMMARY_EVENT_KINDS as _SUMMARY_DELTA_KINDS,
+    CursorEventProjector,
+)
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -314,6 +317,8 @@ class CursorTurnResult:
     model_used: str = ""
     token_usage_last: Optional[dict] = None   # last turn's TokenUsage
     token_usage_total: Optional[dict] = None  # cumulative run TokenUsage
+    # Native context-compaction events observed during the run.
+    compaction_count: int = 0
     # Hint that the bridge/agent is likely wedged or unauthenticated and the
     # caller should retire the session so the next turn starts fresh.
     should_retire: bool = False
@@ -349,6 +354,7 @@ class CursorSDKSession:
         on_text_delta: Optional[Callable[[str], None]] = None,
         on_reasoning_delta: Optional[Callable[[str], None]] = None,
         on_step: Optional[Callable[[Any], None]] = None,
+        on_summary_event: Optional[Callable[[str, str], None]] = None,
         sdk_module: Any = None,
         custom_tools_builder: Optional[Callable[..., dict]] = None,
     ) -> None:
@@ -367,6 +373,7 @@ class CursorSDKSession:
         self._on_text_delta = on_text_delta
         self._on_reasoning_delta = on_reasoning_delta
         self._on_step = on_step
+        self._on_summary_event = on_summary_event
         self._sdk = sdk_module
         self._custom_tools_builder = custom_tools_builder
 
@@ -375,6 +382,13 @@ class CursorSDKSession:
         self._agent_id: Optional[str] = None
         self._sticky_model: str = ""
         self._interrupt_event = threading.Event()
+        # Monotonic counter bumped by every request_interrupt(). A turn
+        # captures it at entry and only honors interrupts raised afterwards —
+        # a stale event from a between-turns landing (e.g. a busy-submit
+        # cancel aimed at an already-finished run) must not poison the next
+        # turn. Guards the "two quick messages" race.
+        self._interrupt_generation = 0
+        self._interrupt_lock = threading.Lock()
         self._closed = False
 
     # ---------- config accessors ----------
@@ -623,17 +637,20 @@ class CursorSDKSession:
 
     def request_interrupt(self) -> None:
         """Idempotent: signal the active turn loop to cancel the run."""
+        with self._interrupt_lock:
+            self._interrupt_generation += 1
         self._interrupt_event.set()
 
-    def _interrupted(self) -> bool:
-        if self._interrupt_event.is_set():
-            return True
-        if self._interrupt_check is not None:
-            try:
-                return bool(self._interrupt_check())
-            except Exception:
-                return False
-        return False
+    def _interrupt_pending_since(self, entry_generation: int) -> bool:
+        """True only when an interrupt was raised after ``entry_generation``.
+
+        The generation check is what makes interrupts turn-scoped: an event
+        that landed between turns (generation unchanged since entry) is
+        stale and must not cancel a run it was never aimed at.
+        """
+        if self._interrupt_generation == entry_generation:
+            return False
+        return self._interrupt_event.is_set()
 
     # ---------- per-turn ----------
 
@@ -652,11 +669,13 @@ class CursorSDKSession:
         SDK makes overrides sticky, matching Hermes' own semantics.
         ``images``: list of ``{"data": <b64>, "mime_type": ...}`` mappings.
         """
-        # ``request_interrupt()`` is scoped to the active turn. Without this,
-        # one cancelled run poisons every later run on the reused SDK session.
-        # The parent AIAgent flag is checked separately through
-        # ``interrupt_check`` and remains authoritative for an interrupt that
-        # races with turn startup.
+        # Interrupts are scoped to the active turn by generation: capture the
+        # counter at entry and only honor interrupts raised afterwards
+        # (``_interrupt_pending_since``). An interrupt that landed between
+        # turns — a busy-submit cancel aimed at the previous, already-finished
+        # run — is stale and must not poison this run. Clearing the stale
+        # event here is tidy-up; the generation check is the real guard.
+        entry_generation = self._interrupt_generation
         self._interrupt_event.clear()
         result = CursorTurnResult()
         try:
@@ -683,7 +702,7 @@ class CursorSDKSession:
         result.run_id = str(getattr(run, "id", "") or "")
 
         projector = CursorEventProjector()
-        stream_drained = self._consume_stream(run, projector, result)
+        stream_drained = self._consume_stream(run, projector, result, entry_generation)
 
         # ``Run.wait()`` has no timeout and drains the same event stream.
         # Calling it after our cancel-drain deadline expired can hang forever
@@ -790,6 +809,22 @@ class CursorSDKSession:
             if isinstance(update, dict)
             else getattr(update, "type", "")
         )
+        # SummaryUpdate / SummaryStartedUpdate / SummaryCompletedUpdate ride
+        # the interaction-update channel (not run.messages()). Forward them so
+        # the context meter can drop its stale pre-compaction reading.
+        if update_type in _SUMMARY_DELTA_KINDS and self._on_summary_event is not None:
+            summary = (
+                update.get("summary", "")
+                if isinstance(update, dict)
+                else getattr(update, "summary", "")
+            )
+            try:
+                self._on_summary_event(
+                    _SUMMARY_DELTA_KINDS[update_type], str(summary or "")
+                )
+            except Exception:
+                logger.debug("cursor summary-event hook raised", exc_info=True)
+            return
         text = (
             update.get("text", "")
             if isinstance(update, dict)
@@ -893,7 +928,11 @@ class CursorSDKSession:
     # ---------- stream consumption ----------
 
     def _consume_stream(
-        self, run: Any, projector: CursorEventProjector, result: CursorTurnResult
+        self,
+        run: Any,
+        projector: CursorEventProjector,
+        result: CursorTurnResult,
+        entry_generation: int,
     ) -> bool:
         """Pump run.messages() through the projector with interrupt + idle
         timeout support. Blocking iterator → pump thread + polled queue.
@@ -921,12 +960,24 @@ class CursorSDKSession:
         cancel_requested = False
         cancel_deadline: Optional[float] = None
 
+        def _interrupt_pending() -> bool:
+            if self._interrupt_pending_since(entry_generation):
+                return True
+            # Legacy external hook (kept for direct-session embedders; the
+            # runtime no longer wires the AIAgent flag through it).
+            if self._interrupt_check is not None:
+                try:
+                    return bool(self._interrupt_check())
+                except Exception:
+                    return False
+            return False
+
         while True:
             try:
                 kind, payload = events.get(timeout=_POLL_SECONDS)
             except queue.Empty:
                 now = time.monotonic()
-                if not cancel_requested and self._interrupted():
+                if not cancel_requested and _interrupt_pending():
                     self._request_run_cancel(run)
                     cancel_requested = True
                     cancel_deadline = now + _CANCEL_DRAIN_SECONDS
@@ -966,6 +1017,14 @@ class CursorSDKSession:
                     self._on_tool_event(name, preview, args)
                 except Exception:
                     logger.debug("cursor tool-progress hook raised", exc_info=True)
+            if projection.compaction is not None:
+                result.compaction_count += 1
+                if self._on_summary_event is not None:
+                    event_kind, event_summary = projection.compaction
+                    try:
+                        self._on_summary_event(event_kind, event_summary)
+                    except Exception:
+                        logger.debug("cursor summary-event hook raised", exc_info=True)
             if projection.messages:
                 result.projected_messages.extend(projection.messages)
             if projection.is_tool_iteration:
@@ -974,7 +1033,7 @@ class CursorSDKSession:
                 usage = _usage_to_dict(projection.usage)
                 if usage:
                     result.token_usage_last = usage
-            if not cancel_requested and self._interrupted():
+            if not cancel_requested and _interrupt_pending():
                 self._request_run_cancel(run)
                 cancel_requested = True
                 cancel_deadline = time.monotonic() + _CANCEL_DRAIN_SECONDS

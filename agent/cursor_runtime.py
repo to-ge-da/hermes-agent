@@ -334,6 +334,20 @@ def _build_cursor_session(agent, effective_task_id: str):
         except Exception:
             logger.debug("cursor step callback raised", exc_info=True)
 
+    def _on_summary_event(kind: str, summary: str) -> None:
+        # Cursor compacted its own context window bridge/server-side. The
+        # meter's last real reading is now stale (pre-compaction) — hand the
+        # event to the compressor so the gauge parks at "unknown" until the
+        # next usage event reports the shrunken window, instead of pinning
+        # at/over 100% (the 728K/500K report).
+        compressor = getattr(agent, "context_compressor", None)
+        note = getattr(compressor, "note_external_compaction", None)
+        if callable(note):
+            try:
+                note(kind=kind, summary=summary)
+            except Exception:
+                logger.debug("compressor external-compaction note failed", exc_info=True)
+
     return CursorSDKSession(
         cwd=cwd,
         api_key=getattr(agent, "api_key", None),
@@ -349,9 +363,12 @@ def _build_cursor_session(agent, effective_task_id: str):
         on_text_delta=_on_text_delta,
         on_reasoning_delta=_on_reasoning_delta,
         on_step=_on_step if getattr(agent, "step_callback", None) is not None else None,
-        # Poll the agent's interrupt flag so /stop (gateway) and Ctrl+C (CLI)
-        # cancel the in-flight cursor run.
-        interrupt_check=lambda: bool(getattr(agent, "_interrupt_requested", False)),
+        on_summary_event=_on_summary_event,
+        # Interrupts reach the session through AIAgent.interrupt() →
+        # session.request_interrupt() (generation-scoped per turn). Do NOT
+        # poll the agent's _interrupt_requested flag here: a busy-submit
+        # interrupt that lands after the previous turn's finalize would
+        # otherwise cancel the NEXT turn outright (quick double-message bug).
     )
 
 

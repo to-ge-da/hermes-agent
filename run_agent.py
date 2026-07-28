@@ -2927,6 +2927,21 @@ class AIAgent:
                         exc_info=True,
                     )
 
+        # Cursor runtime watches a private per-session interrupt event,
+        # generation-scoped per turn (same design as codex above). Forward
+        # immediately so the in-flight run cancels without waiting for a poll.
+        if getattr(self, "api_mode", None) == "cursor_agent":
+            _cursor_session = getattr(self, "_cursor_session", None)
+            _request_interrupt = getattr(_cursor_session, "request_interrupt", None)
+            if callable(_request_interrupt):
+                try:
+                    _request_interrupt()
+                except Exception:
+                    logger.debug(
+                        "Failed to interrupt cursor turn",
+                        exc_info=True,
+                    )
+
         # A cron turn performs its API request on the conversation thread to
         # avoid the nested interrupt-worker deadlock.  Unlike the normal worker
         # path, its client is registered here so this cross-thread interrupt can
