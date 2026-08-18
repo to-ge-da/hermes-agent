@@ -24,6 +24,11 @@ from agent.memory_manager import build_memory_context_block
 
 logger = logging.getLogger(__name__)
 
+# Recycle the SDK agent when last-step occupancy is in this band of the
+# real window. Untrustworthy readings (occupancy > context_length) must
+# not trip this — they park the meter instead.
+CURSOR_RECYCLE_RATIO = 0.85
+
 _CURSOR_HOST_CONTEXT = (
     "[Hermes host context]\n"
     "You are a Cursor agent running inside Hermes. Hermes provides the "
@@ -91,9 +96,12 @@ def _compose_cursor_user_input(
     *,
     external_memory_context: str = "",
     plugin_user_context: str = "",
+    recycle_note: str = "",
 ) -> str:
     """Add API-only host, memory, and plugin context to one user payload."""
     injections = [_CURSOR_HOST_CONTEXT]
+    if recycle_note:
+        injections.append(recycle_note)
     if external_memory_context:
         fenced_memory = build_memory_context_block(external_memory_context)
         if fenced_memory:
@@ -101,6 +109,49 @@ def _compose_cursor_user_input(
     if plugin_user_context:
         injections.append(plugin_user_context)
     return user_message + "\n\n" + "\n\n".join(injections)
+
+
+_CURSOR_RECYCLE_NOTE = (
+    "[Hermes] Previous Cursor agent session was recycled because the "
+    "context window was nearly full. Continue the same task from this "
+    "message; Hermes still has the earlier transcript."
+)
+
+
+def cursor_window_occupancy(raw_usage: dict) -> int:
+    """Last-step window fill: uncached input + cache hits.
+
+    Exclude ``cache_write_tokens`` (this turn's cache billing, not occupancy)
+    and output/reasoning. The SDK run-total is billing, not fill.
+    """
+    return _coerce_usage_int(raw_usage.get("input_tokens")) + _coerce_usage_int(
+        raw_usage.get("cache_read_tokens")
+    )
+
+
+def cursor_meter_prompt_tokens(
+    raw_usage: dict, context_length: int
+) -> Optional[int]:
+    """Occupancy safe to paint on the context bar, or None if untrustworthy.
+
+    None means: skip ``update_from_response`` and park the gauge. A reading
+    above ``context_length`` is a cumulative/stale billing figure, not fill.
+    """
+    occupancy = cursor_window_occupancy(raw_usage)
+    if occupancy <= 0:
+        return None
+    if context_length > 0 and occupancy > context_length:
+        return None
+    return occupancy
+
+
+def cursor_should_recycle_session(occupancy: int, context_length: int) -> bool:
+    """True when occupancy is real and in the high band of the window."""
+    if occupancy <= 0 or context_length <= 0:
+        return False
+    if occupancy > context_length:
+        return False
+    return occupancy >= int(context_length * CURSOR_RECYCLE_RATIO)
 
 
 def _load_cursor_runtime_config() -> tuple[dict, Optional[dict]]:
@@ -204,16 +255,36 @@ def _record_cursor_usage(agent, turn) -> Dict[str, Any]:
         "reasoning_tokens": canonical_usage.reasoning_tokens,
     }
 
-    # Update the context bar only from the final individual usage event.
-    # When the SDK supplies total-only metadata, retaining the previous meter
-    # is more truthful than displaying a multi-step aggregate as window fill.
+    # Update the context bar only from last-step occupancy (input + cache
+    # read). CanonicalUsage.prompt_tokens also includes cache_write and is
+    # billing, not fill — that is what painted 825K into a 256K bar.
     context_prompt_tokens: Optional[int] = None
     context_usage: Optional[CanonicalUsage] = None
     compressor = getattr(agent, "context_compressor", None)
+    context_length = int(getattr(compressor, "context_length", 0) or 0)
     if last_usage is not None:
         context_usage = _canonicalize(last_usage)
-        context_prompt_tokens = context_usage.prompt_tokens
-    if compressor is not None and context_usage is not None:
+        context_prompt_tokens = cursor_meter_prompt_tokens(
+            last_usage, context_length
+        )
+    recycle = False
+    occupancy = (
+        cursor_window_occupancy(last_usage) if last_usage is not None else 0
+    )
+    if (
+        last_usage is not None
+        and compressor is not None
+        and context_length > 0
+        and occupancy > context_length
+    ):
+        # Cumulative/stale reading: park the gauge rather than pin 100%.
+        note = getattr(compressor, "note_external_compaction", None)
+        if callable(note):
+            try:
+                note(kind="completed", summary="")
+            except Exception:
+                logger.debug("cursor meter park failed", exc_info=True)
+    elif compressor is not None and context_usage is not None and context_prompt_tokens is not None:
         try:
             compressor.update_from_response(
                 {
@@ -232,6 +303,7 @@ def _record_cursor_usage(agent, turn) -> Dict[str, Any]:
             )
         except Exception:
             logger.debug("cursor usage update failed", exc_info=True)
+        recycle = cursor_should_recycle_session(occupancy, context_length)
 
     agent.session_prompt_tokens += prompt_tokens
     agent.session_completion_tokens += completion_tokens
@@ -291,6 +363,8 @@ def _record_cursor_usage(agent, turn) -> Dict[str, Any]:
     }
     if context_prompt_tokens is not None:
         result["last_prompt_tokens"] = context_prompt_tokens
+    if recycle:
+        result["cursor_recycle"] = True
     return result
 
 
@@ -419,10 +493,15 @@ def run_cursor_agent_turn(
     # append again — that would duplicate it.
 
     images = _extract_images_from_content(original_user_message)
+    recycle_note = ""
+    if getattr(agent, "_cursor_recycle_note", False):
+        recycle_note = _CURSOR_RECYCLE_NOTE
+        agent._cursor_recycle_note = False
     outbound_user_message = _compose_cursor_user_input(
         user_message,
         external_memory_context=external_memory_context,
         plugin_user_context=plugin_user_context,
+        recycle_note=recycle_note,
     )
 
     try:
@@ -492,6 +571,23 @@ def run_cursor_agent_turn(
     )
     usage_result = _record_cursor_usage(agent, turn)
     api_calls = 1
+
+    # High-band occupancy: retire the SDK agent so the *next* user turn
+    # creates a fresh Cursor thread. Do not rewrite the live thread.
+    if (
+        usage_result.pop("cursor_recycle", False)
+        and getattr(agent, "_cursor_session", None) is not None
+        and not getattr(turn, "should_retire", False)
+    ):
+        logger.warning(
+            "cursor session recycled (occupancy high; next turn starts a fresh agent)"
+        )
+        try:
+            agent._cursor_session.retire()
+        except Exception:
+            logger.debug("cursor recycle retire failed", exc_info=True)
+        agent._cursor_session = None
+        agent._cursor_recycle_note = True
 
     should_review_skills = False
     if (

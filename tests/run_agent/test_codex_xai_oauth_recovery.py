@@ -1158,6 +1158,28 @@ def test_grok_4_3_context_length_is_1m():
         assert DEFAULT_CONTEXT_LENGTHS[matched_key] == 1_000_000
 
 
+def test_grok_4_6_context_length_is_500k():
+    """grok-4.6 ships with 500K context per docs.x.ai/developers/models/grok-4.6.
+
+    Without a specific key, longest-first substring match lands on
+    ``grok-4`` (256K) and the Cursor TUI paints 825K/256K at 100%.
+    """
+    from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
+
+    assert DEFAULT_CONTEXT_LENGTHS["grok-4.6"] == 500_000
+
+    for slug in ("grok-4.6", "grok-4.6-latest", "x-ai/grok-4.6"):
+        matched_key = max(
+            (k for k in DEFAULT_CONTEXT_LENGTHS if k in slug.lower()),
+            key=len,
+        )
+        assert matched_key == "grok-4.6", (
+            f"Expected longest-first match to land on grok-4.6 for {slug}, "
+            f"got {matched_key}"
+        )
+        assert DEFAULT_CONTEXT_LENGTHS[matched_key] == 500_000
+
+
 def test_grok_4_still_resolves_to_256k():
     """Regression guard: grok-4 (non-.3) must still resolve to 256k."""
     from agent.model_metadata import DEFAULT_CONTEXT_LENGTHS
