@@ -130,6 +130,23 @@ def clear_persisted_agent_record(session_id: Optional[str]) -> None:
         logger.debug("cursor session store clear failed", exc_info=True)
 
 
+def persisted_agent_is_stale(
+    record: Optional[dict],
+    idle_recycle_seconds: float,
+    *,
+    now: Optional[float] = None,
+) -> bool:
+    """True when a persisted cursor agent is older than the idle TTL."""
+    if idle_recycle_seconds <= 0 or not isinstance(record, dict):
+        return False
+    try:
+        updated = float(record.get("updated_at"))
+    except (TypeError, ValueError):
+        return False
+    stamp = time.time() if now is None else now
+    return (stamp - updated) >= idle_recycle_seconds
+
+
 # ---------------------------------------------------------------------------
 # Option builders
 # ---------------------------------------------------------------------------
@@ -390,6 +407,9 @@ class CursorSDKSession:
         self._interrupt_generation = 0
         self._interrupt_lock = threading.Lock()
         self._closed = False
+        # Wall-clock of the last finished turn. Used to recycle a live
+        # agent that sat idle between user messages (bridge/cloud expiry).
+        self._last_turn_monotonic: Optional[float] = None
 
     # ---------- config accessors ----------
 
@@ -410,6 +430,26 @@ class CursorSDKSession:
         except (TypeError, ValueError):
             value = 1800.0
         return max(30.0, value)
+
+    @property
+    def idle_recycle_seconds(self) -> float:
+        """Between-turn idle TTL. 0 disables proactive recycle.
+
+        Distinct from ``timeout_seconds``, which only counts silence
+        *during* a streaming run.
+        """
+        raw = self._config.get("idle_recycle_seconds")
+        if raw is None or raw == "":
+            return 900.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 900.0
+
+    def seconds_idle(self) -> Optional[float]:
+        if self._last_turn_monotonic is None:
+            return None
+        return time.monotonic() - self._last_turn_monotonic
 
     # ---------- lifecycle ----------
 
@@ -556,6 +596,15 @@ class CursorSDKSession:
                 and (self.runtime == "cloud" or record.get("cwd") == self._cwd)
             )
             if persisted_id and same_context:
+                if persisted_agent_is_stale(record, self.idle_recycle_seconds):
+                    logger.info(
+                        "cursor persisted agent %s is stale (idle_recycle=%ss); creating a fresh one",
+                        persisted_id[:16],
+                        int(self.idle_recycle_seconds),
+                    )
+                    clear_persisted_agent_record(self._session_id)
+                    persisted_id = ""
+            if persisted_id and same_context:
                 try:
                     resume_options: dict[str, Any] = {}
                     if self._api_key:
@@ -694,7 +743,11 @@ class CursorSDKSession:
             run = self._send_with_recovery(sdk, message, send_options)
         except Exception as exc:
             result.error = self._format_error("cursor send failed", exc)
-            result.should_retire = self._looks_like_auth_failure(exc)
+            # Dead bridge after idle raises here, not as status=error. Retire
+            # so the next attempt (retry or next user turn) builds a new agent.
+            result.should_retire = True
+            if self._looks_like_auth_failure(exc):
+                logger.warning("cursor send failed auth check: %s", result.error)
             return result
 
         if model:
@@ -743,25 +796,35 @@ class CursorSDKSession:
         if total_usage:
             result.token_usage_total = total_usage
 
-        if status == "error" and not result.error:
-            result.error = self._format_error(
-                "cursor run ended in error",
-                terminal_text or "(no error detail from the run)",
+        if status == "error":
+            if not result.error:
+                result.error = self._format_error(
+                    "cursor run ended in error",
+                    terminal_text or "(no error detail from the run)",
+                )
+            result.should_retire = True
+            logger.warning(
+                "cursor run ended in error (agent=%s run=%s detail=%s)",
+                (self._agent_id or "")[:16],
+                result.run_id,
+                result.error,
             )
         if status == "expired" and not result.error:
             result.error = "cursor run expired before completing"
             result.should_retire = True
 
-        # Refresh the persisted record so resume survives restarts.
-        persist_agent_record(
-            self._session_id,
-            {
-                "agent_id": self._agent_id,
-                "runtime": self.runtime,
-                "cwd": self._cwd,
-                "model": self._sticky_model or self._model,
-            },
-        )
+        self._last_turn_monotonic = time.monotonic()
+        # Do not persist a wedged/errored agent id — resume would revive it.
+        if not result.should_retire:
+            persist_agent_record(
+                self._session_id,
+                {
+                    "agent_id": self._agent_id,
+                    "runtime": self.runtime,
+                    "cwd": self._cwd,
+                    "model": self._sticky_model or self._model,
+                },
+            )
         return result
 
     # ---------- send helpers ----------
@@ -1007,6 +1070,7 @@ class CursorSDKSession:
             if kind == "error":
                 if not result.error:
                     result.error = self._format_error("cursor stream failed", payload)
+                result.should_retire = True
                 return False
 
             idle_deadline = time.monotonic() + self.timeout_seconds

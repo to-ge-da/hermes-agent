@@ -117,6 +117,17 @@ _CURSOR_RECYCLE_NOTE = (
     "message; Hermes still has the earlier transcript."
 )
 
+_CURSOR_IDLE_NOTE = (
+    "[Hermes] Previous Cursor agent session was recycled after sitting idle. "
+    "Continue the same task from this message; Hermes still has the earlier "
+    "transcript."
+)
+
+_CURSOR_STALE_NOTE = (
+    "[Hermes] Previous Cursor agent session ended in error (typically after "
+    "idle). Retrying on a fresh agent; Hermes still has the earlier transcript."
+)
+
 
 def cursor_window_occupancy(raw_usage: dict) -> int:
     """Last-step window fill: uncached input + cache hits.
@@ -152,6 +163,46 @@ def cursor_should_recycle_session(occupancy: int, context_length: int) -> bool:
     if occupancy > context_length:
         return False
     return occupancy >= int(context_length * CURSOR_RECYCLE_RATIO)
+
+
+def cursor_should_idle_recycle(
+    idle_seconds: Optional[float], threshold: float
+) -> bool:
+    """True when a live Cursor agent has sat unused past the idle TTL."""
+    if threshold <= 0 or idle_seconds is None:
+        return False
+    return idle_seconds >= threshold
+
+
+def cursor_turn_is_retryable(turn: Any) -> bool:
+    """True when this turn failed in a way a fresh Cursor agent may fix.
+
+    Auth failures are not retryable. Empty ``status=error`` after idle, send
+    failures, stream failures, and explicit expire/idle-timeout are.
+    """
+    if getattr(turn, "interrupted", False):
+        return False
+    error = getattr(turn, "error", None)
+    if not error:
+        return False
+    text = str(error).lower()
+    if "api key" in text or "unauthorized" in text or "unauthenticated" in text:
+        return False
+    if getattr(turn, "should_retire", False):
+        return True
+    status = str(getattr(turn, "status", "") or "").lower()
+    return status in {"error", "expired"}
+
+
+def _retire_cursor_session(agent) -> None:
+    session = getattr(agent, "_cursor_session", None)
+    if session is None:
+        return
+    try:
+        session.retire()
+    except Exception:
+        logger.debug("cursor session retire failed", exc_info=True)
+    agent._cursor_session = None
 
 
 def _load_cursor_runtime_config() -> tuple[dict, Optional[dict]]:
@@ -484,7 +535,7 @@ def run_cursor_agent_turn(
     """
     # Lazy session: one CursorSDKSession per AIAgent instance. Created on
     # first turn, reused across turns (the SDK agent keeps conversation
-    # context server/bridge-side), retired on wedge/crash.
+    # context server/bridge-side), retired on wedge/crash/idle.
     if getattr(agent, "_cursor_session", None) is None:
         agent._cursor_session = _build_cursor_session(agent, effective_task_id)
 
@@ -497,6 +548,20 @@ def run_cursor_agent_turn(
     if getattr(agent, "_cursor_recycle_note", False):
         recycle_note = _CURSOR_RECYCLE_NOTE
         agent._cursor_recycle_note = False
+
+    session = agent._cursor_session
+    idle_threshold = getattr(session, "idle_recycle_seconds", 900.0)
+    idle_seconds = session.seconds_idle() if hasattr(session, "seconds_idle") else None
+    if cursor_should_idle_recycle(idle_seconds, idle_threshold):
+        logger.info(
+            "cursor session idle for %.0fs (threshold=%ss) — retiring before send",
+            idle_seconds,
+            int(idle_threshold),
+        )
+        _retire_cursor_session(agent)
+        agent._cursor_session = _build_cursor_session(agent, effective_task_id)
+        recycle_note = recycle_note or _CURSOR_IDLE_NOTE
+
     outbound_user_message = _compose_cursor_user_input(
         user_message,
         external_memory_context=external_memory_context,
@@ -517,11 +582,7 @@ def run_cursor_agent_turn(
         logger.exception("cursor runtime turn failed")
         # Crash → unconditionally drop the session so the next turn
         # rebuilds bridge + agent instead of reusing a dead client.
-        try:
-            agent._cursor_session.retire()
-        except Exception:
-            pass
-        agent._cursor_session = None
+        _retire_cursor_session(agent)
         return _finalize_cursor_result(agent, {
             "final_response": (
                 f"Cursor runtime turn failed: {exc}. "
@@ -536,15 +597,49 @@ def run_cursor_agent_turn(
             "interrupted": False,
         })
 
+    # Stale/dead agent after idle: one automatic retry on a fresh SDK agent
+    # so the user does not have to open a new Hermes session.
+    if cursor_turn_is_retryable(turn):
+        logger.warning(
+            "cursor turn failed (%s); retiring and retrying once on a fresh agent",
+            turn.error,
+        )
+        _retire_cursor_session(agent)
+        agent._cursor_session = _build_cursor_session(agent, effective_task_id)
+        retry_input = _compose_cursor_user_input(
+            user_message,
+            external_memory_context=external_memory_context,
+            plugin_user_context=plugin_user_context,
+            recycle_note=_CURSOR_STALE_NOTE,
+        )
+        try:
+            turn = agent._cursor_session.run_turn(
+                retry_input,
+                images=images or None,
+                model=getattr(agent, "model", "") or None,
+            )
+        except Exception as exc:
+            logger.exception("cursor runtime retry failed")
+            _retire_cursor_session(agent)
+            return _finalize_cursor_result(agent, {
+                "final_response": (
+                    f"Cursor runtime turn failed: {exc}. "
+                    "Check `hermes doctor` and your CURSOR_API_KEY, or switch "
+                    "providers with /model."
+                ),
+                "messages": messages,
+                "api_calls": 0,
+                "completed": False,
+                "partial": True,
+                "error": str(exc),
+                "interrupted": False,
+            })
+
     # Wedged bridge / expired run / auth failure → retire the session so the
     # next turn starts fresh (mirrors the codex runtime's retire semantics).
     if getattr(turn, "should_retire", False):
         logger.warning("cursor session retired (turn error: %s)", turn.error)
-        try:
-            agent._cursor_session.retire()
-        except Exception:
-            pass
-        agent._cursor_session = None
+        _retire_cursor_session(agent)
 
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries — exactly

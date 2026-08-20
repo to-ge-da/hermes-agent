@@ -1675,6 +1675,10 @@ DEFAULT_CONFIG = {
         "timeout_seconds": 1800,     # Per-turn idle timeout. Resets on every stream event,
                                      # so long turns stay alive while events flow; a silent
                                      # bridge past this window retires the session.
+        "idle_recycle_seconds": 900, # Between-turn TTL. After this much silence the next
+                                     # user message starts a fresh Cursor agent instead of
+                                     # sending to a likely-dead bridge. 0 disables.
+                                     # Distinct from timeout_seconds (in-run silence).
         "cloud": {
             "repos": [],             # Repositories cloned into the cloud VM when
                                      # runtime: cloud. Each entry: {url: ..., ref: ...}
